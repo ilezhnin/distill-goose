@@ -5,9 +5,10 @@ use crate::session::session_manager::SessionUsageTotals;
 use crate::session::Session;
 use crate::slash_commands::types::{SlashCommandEntry, SlashCommandSource};
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionInfo, SessionMode,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, UnstructuredCommandInput,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionId, SessionInfo, SessionMode, SessionModeId,
+    SessionModeState, SessionNotification, SessionUpdate, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use goose_providers::model::ModelConfig;
@@ -15,8 +16,9 @@ use goose_providers::thinking::{ThinkingEffort, ThinkingEffortCapability, Thinki
 use serde::Serialize;
 use strum::{EnumMessage, VariantNames};
 
-use super::provider::resolve_effort_value;
+use super::provider::{resolve_effort_value, AcpProvider};
 use super::server::{build_usage_updates, DEFAULT_PROVIDER_ID, DEFAULT_PROVIDER_LABEL};
+use crate::providers::base::Provider;
 
 pub(super) fn session_provider_selection(session: &Session) -> &str {
     session
@@ -242,10 +244,29 @@ pub(super) async fn agent_thinking_effort_support(agent: &Agent) -> ThinkingEffo
     }
 }
 
+/// The config options advertised by the external ACP agent behind this
+/// provider, or `None` for providers that don't bridge to one. An ACP
+/// provider whose agent advertised nothing yields `Some(vec![])`: goose still
+/// can't influence such an agent's reasoning, so the synthetic thinking-effort
+/// menu stays suppressed either way.
+pub(super) fn provider_acp_child_config_options(
+    provider: &dyn Provider,
+) -> Option<Vec<SessionConfigOption>> {
+    let acp_provider = provider.as_any()?.downcast_ref::<AcpProvider>()?;
+    Some(acp_provider.child_session_config_options())
+}
+
+async fn agent_acp_child_config_options(agent: &Agent) -> Option<Vec<SessionConfigOption>> {
+    match agent.provider().await {
+        Ok(provider) => provider_acp_child_config_options(provider.as_ref()),
+        Err(_) => None,
+    }
+}
+
 pub(super) async fn build_session_setup_config(
     provider_inventory: &ProviderInventoryService,
     session: &Session,
-    effort_support: &ThinkingEffortSupport,
+    agent: &Agent,
 ) -> Result<(SessionModeState, Option<Vec<SessionConfigOption>>), agent_client_protocol::Error> {
     let mode_state = build_mode_state(session.goose_mode)?;
 
@@ -264,13 +285,16 @@ pub(super) async fn build_session_setup_config(
     let model_state = build_model_state(model_config.model_name.as_str(), &inventory);
     let provider_selection = session_provider_selection(session);
     let provider_options = build_provider_options(Some(provider_name)).await;
+    let effort_support = agent_thinking_effort_support(agent).await;
+    let acp_child_options = agent_acp_child_config_options(agent).await;
     let config_options = build_config_options(
         &mode_state,
         &model_state,
         model_config,
         provider_selection,
         provider_options,
-        effort_support,
+        &effort_support,
+        acp_child_options.as_deref(),
     );
     Ok((mode_state, Some(config_options)))
 }
@@ -282,6 +306,7 @@ pub(super) fn build_config_options(
     provider_selection: &str,
     provider_options: Vec<SessionConfigSelectOption>,
     effort_support: &ThinkingEffortSupport,
+    acp_child_options: Option<&[SessionConfigOption]>,
 ) -> Vec<SessionConfigOption> {
     let mode_options: Vec<SessionConfigSelectOption> = mode_state
         .available_modes
@@ -291,14 +316,23 @@ pub(super) fn build_config_options(
                 .description(m.description.clone())
         })
         .collect();
+    let child_model_options = acp_child_options
+        .map(child_model_select_options)
+        .unwrap_or_default();
     let model_options: Vec<SessionConfigSelectOption> = model_state
         .available_models
         .iter()
-        .map(|m| SessionConfigSelectOption::new(m.id.clone(), m.name.clone()))
+        .map(|m| {
+            // The ACP agent's own entry wins: it carries the display name and
+            // description goose's inventory only knows as a raw id.
+            child_model_options
+                .iter()
+                .find(|option| option.value.0.as_ref() == m.id)
+                .cloned()
+                .unwrap_or_else(|| SessionConfigSelectOption::new(m.id.clone(), m.name.clone()))
+        })
         .collect();
-    let (thinking_effort_options, current_thinking_effort) =
-        build_thinking_effort_choices(model_config, effort_support);
-    vec![
+    let mut options = vec![
         SessionConfigOption::select(
             "provider",
             "Provider",
@@ -319,15 +353,79 @@ pub(super) fn build_config_options(
             model_options,
         )
         .category(SessionConfigOptionCategory::Model),
-        SessionConfigOption::select(
-            "thinking_effort",
-            "Thinking effort",
-            current_thinking_effort,
-            thinking_effort_options,
-        )
-        .description("Controls reasoning effort for models that support extended thinking.")
-        .category(SessionConfigOptionCategory::ThoughtLevel),
-    ]
+    ];
+    match acp_child_options {
+        // A session backed by an ACP agent surfaces the agent's own options
+        // verbatim. Goose's synthetic thinking_effort would be a placebo
+        // there — the agent manages its own reasoning — whether or not the
+        // agent offers an effort selector of its own.
+        Some(child_options) => options.extend(passthrough_config_options(child_options)),
+        None => {
+            let (thinking_effort_options, current_thinking_effort) =
+                build_thinking_effort_choices(model_config, effort_support);
+            options.push(
+                SessionConfigOption::select(
+                    "thinking_effort",
+                    "Thinking effort",
+                    current_thinking_effort,
+                    thinking_effort_options,
+                )
+                .description(
+                    "Controls reasoning effort for models that support extended thinking.",
+                )
+                .category(SessionConfigOptionCategory::ThoughtLevel),
+            );
+        }
+    }
+    options
+}
+
+/// The child agent's config options goose passes through verbatim: everything
+/// except the mode and model selectors goose already owns and maps, plus any
+/// id that would collide with one of goose's own options.
+fn passthrough_config_options(child_options: &[SessionConfigOption]) -> Vec<SessionConfigOption> {
+    child_options
+        .iter()
+        .filter(|option| {
+            !matches!(
+                option.category,
+                Some(SessionConfigOptionCategory::Mode) | Some(SessionConfigOptionCategory::Model)
+            ) && !matches!(
+                option.id.0.as_ref(),
+                "provider" | "mode" | "model" | "thinking_effort"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// The entries of the child agent's model selector, flattened across groups.
+fn child_model_select_options(
+    child_options: &[SessionConfigOption],
+) -> Vec<SessionConfigSelectOption> {
+    child_options
+        .iter()
+        .find_map(|option| {
+            if option.category != Some(SessionConfigOptionCategory::Model) {
+                return None;
+            }
+            match &option.kind {
+                SessionConfigKind::Select(select) => Some(flatten_select_options(&select.options)),
+                _ => None,
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn flatten_select_options(options: &SessionConfigSelectOptions) -> Vec<SessionConfigSelectOption> {
+    match options {
+        SessionConfigSelectOptions::Ungrouped(options) => options.clone(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter().cloned())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// A provider that manages its own reasoning decides the menu: it mirrors the
@@ -723,6 +821,7 @@ mod tests {
             provider_name,
             provider_options,
             &ThinkingEffortSupport::Unspecified,
+            None,
         )
     }
 
@@ -744,6 +843,7 @@ mod tests {
             "openai",
             vec![SessionConfigSelectOption::new("openai", "openai")],
             &ThinkingEffortSupport::Unspecified,
+            None,
         );
         let option = options
             .iter()
@@ -774,6 +874,7 @@ mod tests {
             "openai",
             vec![SessionConfigSelectOption::new("openai", "openai")],
             &ThinkingEffortSupport::Unspecified,
+            None,
         );
         let option = options
             .iter()
@@ -830,6 +931,7 @@ mod tests {
             "claude-acp",
             vec![SessionConfigSelectOption::new("claude-acp", "claude-acp")],
             effort_support,
+            None,
         );
         let option = options
             .into_iter()
@@ -910,5 +1012,144 @@ mod tests {
 
         assert_eq!(current, "off");
         assert_eq!(values, vec![SessionConfigSelectOption::new("off", "off")]);
+    }
+
+    fn claude_child_options() -> Vec<SessionConfigOption> {
+        vec![
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                "acceptEdits",
+                vec![
+                    SessionConfigSelectOption::new("default", "Always ask"),
+                    SessionConfigSelectOption::new("acceptEdits", "Accept edits"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Mode),
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "opus",
+                vec![
+                    SessionConfigSelectOption::new("default", "Default (recommended)")
+                        .description("Opus 4.6 · Most capable"),
+                    SessionConfigSelectOption::new("opus", "Opus"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::select(
+                "effort",
+                "Effort",
+                "high",
+                vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("high", "High"),
+                    SessionConfigSelectOption::new("max", "Max"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+            SessionConfigOption::boolean("fast", "Fast mode", false)
+                .description("Trade quality for speed.")
+                .category(SessionConfigOptionCategory::ModelConfig),
+        ]
+    }
+
+    fn build_acp_config_options(
+        child_options: Option<&[SessionConfigOption]>,
+    ) -> Vec<SessionConfigOption> {
+        let mode_state = build_mode_state(GooseMode::Auto).unwrap();
+        let model_state = model_selection("opus", &["opus", "default"]);
+        let model_config = ModelConfig::new("opus");
+        build_config_options(
+            &mode_state,
+            &model_state,
+            &model_config,
+            "claude-acp",
+            vec![SessionConfigSelectOption::new("claude-acp", "claude-acp")],
+            &ThinkingEffortSupport::Unsupported,
+            child_options,
+        )
+    }
+
+    #[test]
+    fn test_build_config_options_passes_acp_child_options_through_verbatim() {
+        let child_options = claude_child_options();
+
+        let options = build_acp_config_options(Some(&child_options));
+
+        let ids: Vec<&str> = options
+            .iter()
+            .map(|option| option.id.0.as_ref())
+            .collect();
+        assert_eq!(ids, vec!["provider", "mode", "model", "effort", "fast"]);
+
+        let effort = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "effort")
+            .expect("effort option");
+        assert_eq!(effort, &child_options[2], "child effort passes through verbatim");
+        assert_eq!(
+            effort.category,
+            Some(SessionConfigOptionCategory::ThoughtLevel)
+        );
+
+        let fast = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "fast")
+            .expect("fast option");
+        assert_eq!(fast, &child_options[3], "child fast option passes through verbatim");
+        assert!(matches!(fast.kind, SessionConfigKind::Boolean(_)));
+    }
+
+    #[test]
+    fn test_build_config_options_acp_model_select_carries_child_display_names() {
+        let child_options = claude_child_options();
+
+        let options = build_acp_config_options(Some(&child_options));
+
+        let model = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "model")
+            .expect("model option");
+        let SessionConfigKind::Select(select) = &model.kind else {
+            panic!("model should be a select option");
+        };
+        assert_eq!(select.current_value.0.as_ref(), "opus");
+        assert_eq!(
+            select.options,
+            SessionConfigSelectOptions::Ungrouped(vec![
+                SessionConfigSelectOption::new("opus", "Opus"),
+                SessionConfigSelectOption::new("default", "Default (recommended)")
+                    .description("Opus 4.6 · Most capable"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_build_config_options_acp_session_without_child_options_offers_no_effort() {
+        let options = build_acp_config_options(Some(&[]));
+
+        assert!(
+            !options
+                .iter()
+                .any(|option| option.id.0.as_ref() == "thinking_effort"),
+            "an ACP session must not offer goose's placebo thinking_effort"
+        );
+        let ids: Vec<&str> = options
+            .iter()
+            .map(|option| option.id.0.as_ref())
+            .collect();
+        assert_eq!(ids, vec!["provider", "mode", "model"]);
+    }
+
+    #[test]
+    fn test_build_config_options_native_session_output_is_unchanged_by_passthrough() {
+        let native = build_acp_config_options(None);
+
+        let ids: Vec<&str> = native
+            .iter()
+            .map(|option| option.id.0.as_ref())
+            .collect();
+        assert_eq!(ids, vec!["provider", "mode", "model", "thinking_effort"]);
     }
 }
