@@ -134,48 +134,41 @@ impl HandleDispatchFrom<Client> for GooseAcpHandler {
                         let cx_spawn = cx.clone();
                         cx.spawn(async move {
                             let cx = cx_spawn;
-                            let value_id = match req.value.as_value_id() {
-                                Some(value_id) => value_id.clone(),
-                                None => {
-                                    responder.respond_with_error(
-                                        agent_client_protocol::Error::invalid_params().data("Expected a value ID")
-                                    )?;
-                                    return Ok(());
-                                }
-                            };
                             let session_id = req.session_id.clone();
                             let config_id = req.config_id.0.to_string();
+                            // goose's own options are selects and require a value ID;
+                            // anything else is forwarded to the ACP agent behind the
+                            // session's provider, which may also take a boolean.
                             match config_id.as_ref() {
-                                "provider" => {
-                                    Config::global().invalidate_secrets_cache();
-                                    match agent.update_provider(&session_id.0, &value_id.0, None, None, None).await {
-                                        Ok(_) => {}
-                                        Err(e) => { responder.respond_with_error(e)?; return Ok(()); }
-                                    }
-                                }
-                                "mode" => {
-                                    match agent.on_set_mode(&session_id.0, &value_id.0).await {
-                                        Ok(_) => {}
-                                        Err(e) => { responder.respond_with_error(e)?; return Ok(()); }
-                                    }
-                                }
-                                "model" => {
-                                    match agent.on_set_model(&session_id.0, &value_id.0).await {
-                                        Ok(_) => {}
-                                        Err(e) => { responder.respond_with_error(e)?; return Ok(()); }
-                                    }
-                                }
-                                "thinking_effort" => {
-                                    match agent.on_set_thinking_effort(&session_id.0, &value_id.0).await {
-                                        Ok(_) => {}
-                                        Err(e) => { responder.respond_with_error(e)?; return Ok(()); }
+                                "provider" | "mode" | "model" | "thinking_effort" => {
+                                    let value_id = match req.value.as_value_id() {
+                                        Some(value_id) => value_id.clone(),
+                                        None => {
+                                            responder.respond_with_error(
+                                                agent_client_protocol::Error::invalid_params().data("Expected a value ID")
+                                            )?;
+                                            return Ok(());
+                                        }
+                                    };
+                                    let result = match config_id.as_ref() {
+                                        "provider" => {
+                                            Config::global().invalidate_secrets_cache();
+                                            agent.update_provider(&session_id.0, &value_id.0, None, None, None).await.map(|_| ())
+                                        }
+                                        "mode" => agent.on_set_mode(&session_id.0, &value_id.0).await.map(|_| ()),
+                                        "model" => agent.on_set_model(&session_id.0, &value_id.0).await,
+                                        _ => agent.on_set_thinking_effort(&session_id.0, &value_id.0).await,
+                                    };
+                                    if let Err(e) = result {
+                                        responder.respond_with_error(e)?;
+                                        return Ok(());
                                     }
                                 }
                                 other => {
-                                    responder.respond_with_error(
-                                        agent_client_protocol::Error::invalid_params().data(format!("Unsupported config option: {}", other))
-                                    )?;
-                                    return Ok(());
+                                    if let Err(e) = agent.on_set_child_config_option(&session_id.0, other, &req.value).await {
+                                        responder.respond_with_error(e)?;
+                                        return Ok(());
+                                    }
                                 }
                             }
                             // Respond immediately using the current provider inventory snapshot.
@@ -195,8 +188,10 @@ impl HandleDispatchFrom<Client> for GooseAcpHandler {
                             cx.send_notification(notification)?;
                             responder.respond(SetSessionConfigOptionResponse::new(config_options))?;
 
-                            let maybe_refresh = if config_id == "provider" {
-                                let provider_id = value_id.0.to_string();
+                            let provider_value_id = (config_id == "provider")
+                                .then(|| req.value.as_value_id().map(|value_id| value_id.0.to_string()))
+                                .flatten();
+                            let maybe_refresh = if let Some(provider_id) = provider_value_id {
                                 agent
                                     .provider_inventory
                                     .plan_refresh_jobs(std::slice::from_ref(&provider_id))

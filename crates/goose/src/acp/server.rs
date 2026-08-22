@@ -2,13 +2,13 @@ use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 use crate::acp::fs::AcpTools;
 pub(super) use crate::acp::response_builder::{
-    agent_thinking_effort_support, build_config_options, build_mode_state, build_model_state,
-    build_provider_options, build_session_info, build_session_setup_config,
+    build_config_options, build_mode_state, build_model_state, build_provider_options,
+    build_session_info, build_session_setup_config, provider_acp_child_config_options,
     send_session_setup_notifications, session_meta, session_provider_selection,
     session_response_meta, should_refresh_inventory_for_session_init,
 };
 use crate::acp::tool_call_notifier::ToolCallNotifier;
-use crate::acp::{PermissionDecision, ACP_CURRENT_MODEL};
+use crate::acp::{AcpProvider, PermissionDecision, ACP_CURRENT_MODEL};
 use crate::agents::extension::{Envs, PLATFORM_EXTENSIONS};
 use crate::agents::mcp_client::{GooseMcpHostInfo, McpClientTrait};
 use crate::agents::platform_extensions::developer::DeveloperClient;
@@ -50,8 +50,9 @@ use agent_client_protocol::schema::v1::{
     McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionDeleteCapabilities, SessionId,
-    SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionValue,
+    SessionDeleteCapabilities, SessionId, SessionInfoUpdate, SessionListCapabilities,
+    SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, TextContent, ToolCallId, ToolCallUpdate, Usage,
     UsageUpdate,
@@ -184,6 +185,18 @@ fn thinking_effort_error(error: anyhow::Error) -> agent_client_protocol::Error {
     // `{error:#}` rather than `{error}`: context layering hides the cause chain,
     // including the variant this mapping branched on.
     base.data(format!("Failed to update thinking effort: {error:#}"))
+}
+
+/// A config option forwarded to the ACP agent behind the provider fails with
+/// whatever error the agent answered — its code (e.g. `invalid_params` for a
+/// rejected value) passes through verbatim. Goose-side transport failures
+/// carry no ACP error and become internal errors.
+fn child_config_option_error(error: anyhow::Error) -> agent_client_protocol::Error {
+    match error.downcast::<agent_client_protocol::Error>() {
+        Ok(acp_error) => acp_error,
+        Err(error) => agent_client_protocol::Error::internal_error()
+            .data(format!("Failed to set config option: {error:#}")),
+    }
 }
 
 async fn resume_saved_provider_session(
@@ -2272,6 +2285,7 @@ impl GooseAcpAgent {
         let model_state = build_model_state(current_model.as_str(), &inventory);
         let mode_state = build_mode_state(goose_mode)?;
         let provider_options = build_provider_options(Some(&provider_name)).await;
+        let acp_child_options = provider_acp_child_config_options(provider.as_ref());
         let config_options = build_config_options(
             &mode_state,
             &model_state,
@@ -2279,6 +2293,7 @@ impl GooseAcpAgent {
             session_provider_selection(&session),
             provider_options,
             &provider.thinking_effort_support(),
+            acp_child_options.as_deref(),
         );
         let notification = SessionNotification::new(
             session_id.clone(),
@@ -2320,6 +2335,47 @@ impl GooseAcpAgent {
             .map_err(thinking_effort_error)?;
 
         Ok(())
+    }
+
+    /// Forward a config option goose does not own to the ACP agent behind the
+    /// session's provider. Native provider sessions have no such agent, so an
+    /// unknown config id stays an invalid-params error there.
+    async fn on_set_child_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &SessionConfigOptionValue,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let agent = self.get_session_agent(session_id).await?;
+        let provider = agent
+            .provider()
+            .await
+            .internal_err_ctx("Failed to get provider")?;
+        let Some(acp_provider) = provider
+            .as_any()
+            .and_then(|provider| provider.downcast_ref::<AcpProvider>())
+        else {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data(format!("Unsupported config option: {}", config_id)));
+        };
+
+        // The agent's own thinking-effort selector goes through the same path
+        // as goose's `thinking_effort` so the pick is persisted on the session
+        // and re-applied when the provider is recreated (model switch, reload).
+        if acp_provider.effort_option_id().as_deref() == Some(config_id) {
+            if let Some(value_id) = value.as_value_id() {
+                let effort = value_id.0.to_string();
+                return agent
+                    .update_thinking_effort(session_id, &effort)
+                    .await
+                    .map_err(thinking_effort_error);
+            }
+        }
+
+        acp_provider
+            .set_child_config_option(session_id, config_id, value.clone())
+            .await
+            .map_err(child_config_option_error)
     }
 
     async fn update_provider(

@@ -677,6 +677,14 @@ pub trait Provider: Send + Sync {
         Ok(())
     }
 
+    /// Concrete-type escape hatch for integrations that need provider-specific
+    /// surface beyond this trait (e.g. goose passes an ACP agent's own session
+    /// config options through its config surface). Providers that participate
+    /// override this to return `Some(self)` for downcasting.
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
+
     /// How this provider participates in thinking-effort selection. Providers
     /// that manage reasoning through an external harness report the harness's
     /// advertised capability; the default keeps the model-name-based path.

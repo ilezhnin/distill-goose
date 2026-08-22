@@ -4,10 +4,10 @@ use agent_client_protocol::schema::v1::{
     LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallContent, ToolCallStatus, ToolKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent, ToolCallContent, ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo};
@@ -94,7 +94,7 @@ enum ClientRequest {
     SetConfigOption {
         session_id: SessionId,
         config_id: String,
-        value: String,
+        value: SessionConfigOptionValue,
         response_tx: oneshot::Sender<Result<()>>,
     },
     Prompt {
@@ -256,17 +256,34 @@ impl AcpEffortState {
     }
 }
 
+/// Config-option state shared between the provider and the client loop: the
+/// latest full config-options payload the agent sent (mirrored into goose's
+/// own session config surface) plus the thinking-effort capability derived
+/// from it.
 #[derive(Clone)]
-struct AcpSessionState {
-    active_id: Arc<Mutex<Option<SessionId>>>,
+struct AcpConfigState {
+    options: Arc<Mutex<Option<Vec<SessionConfigOption>>>>,
     effort: AcpEffortState,
 }
 
+/// The stored payload and derived capability, taken together so a failed
+/// session load can restore both.
+type AcpConfigSnapshot = (
+    Option<Vec<SessionConfigOption>>,
+    Option<ThinkingEffortCapability>,
+);
+
+#[derive(Clone)]
+struct AcpSessionState {
+    active_id: Arc<Mutex<Option<SessionId>>>,
+    config: AcpConfigState,
+}
+
 impl AcpSessionState {
-    fn new(effort: AcpEffortState) -> Self {
+    fn new(config: AcpConfigState) -> Self {
         Self {
             active_id: Arc::new(Mutex::new(None)),
-            effort,
+            config,
         }
     }
 }
@@ -303,6 +320,11 @@ pub struct AcpProvider {
     /// value, it tracks the agent resetting its own effort (e.g. on a model
     /// switch), so the persisted value is re-applied when that happens.
     effort: AcpEffortState,
+
+    /// Latest full config-options payload from the agent, mirrored from every
+    /// config-options payload it sends. Goose passes these through its own
+    /// session config surface (minus the options goose maps itself).
+    child_config_options: Arc<Mutex<Option<Vec<SessionConfigOption>>>>,
 
     tx: Option<mpsc::Sender<ClientRequest>>,
     cancel_tx: Option<oneshot::Sender<()>>,
@@ -399,13 +421,16 @@ impl AcpProvider {
         let pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let context_size = Arc::new(AtomicU64::new(0));
-        let effort = AcpEffortState::new();
+        let config_state = AcpConfigState {
+            options: Arc::new(Mutex::new(None)),
+            effort: AcpEffortState::new(),
+        };
         let client_loop = AcpClientLoop::new(
             config,
             goose_mode_shared.clone(),
             pending_tool_updates.clone(),
             context_size.clone(),
-            effort.clone(),
+            config_state.clone(),
         );
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx, cancel_rx));
@@ -450,7 +475,8 @@ impl AcpProvider {
             context_size,
             model_config_option_id,
             applied_model: Arc::new(Mutex::new(applied_model)),
-            effort,
+            effort: config_state.effort,
+            child_config_options: config_state.options,
             tx: client_loop_guard.tx.take(),
             cancel_tx: client_loop_guard.cancel_tx.take(),
             loop_thread: client_loop_guard.thread.take(),
@@ -497,9 +523,19 @@ impl AcpProvider {
 
     pub(crate) async fn send_set_config_option(
         &self,
-        _goose_id: &str,
+        goose_id: &str,
         config_id: String,
         value: String,
+    ) -> Result<()> {
+        self.send_set_config_option_value(goose_id, config_id, SessionConfigOptionValue::from(value.as_str()))
+            .await
+    }
+
+    async fn send_set_config_option_value(
+        &self,
+        _goose_id: &str,
+        config_id: String,
+        value: SessionConfigOptionValue,
     ) -> Result<()> {
         let session_id = self.acp_session_id();
         let (response_tx, response_rx) = oneshot::channel();
@@ -557,6 +593,54 @@ impl AcpProvider {
             .lock()
             .map_err(|_| anyhow::anyhow!("effort_state lock poisoned"))?
             .clone())
+    }
+
+    /// Option id of the agent's thinking-effort selector, if it offers one.
+    pub(crate) fn effort_option_id(&self) -> Option<String> {
+        self.effort_capability()
+            .ok()
+            .flatten()
+            .map(|capability| capability.option_id)
+    }
+
+    /// Latest config options advertised by the agent, falling back to the
+    /// `session/new` / `session/load` snapshot before any update arrived.
+    pub(crate) fn child_session_config_options(&self) -> Vec<SessionConfigOption> {
+        if let Some(options) = self
+            .child_config_options
+            .lock()
+            .ok()
+            .and_then(|latest| latest.clone())
+        {
+            return options;
+        }
+        self.session
+            .lock()
+            .unwrap()
+            .response
+            .config_options
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Forward a config option the client set on goose's surface to the agent
+    /// behind it, aligning the wire shape with the option kind the agent
+    /// advertised. The agent's `SetConfigOption` response refreshes the stored
+    /// options before this returns, so the next config snapshot goose builds
+    /// already carries the agent's rebuilt set.
+    pub(crate) async fn set_child_config_option(
+        &self,
+        goose_id: &str,
+        config_id: &str,
+        value: SessionConfigOptionValue,
+    ) -> Result<()> {
+        let value = align_config_value_with_option_kind(
+            &self.child_session_config_options(),
+            config_id,
+            value,
+        );
+        self.send_set_config_option_value(goose_id, config_id.to_string(), value)
+            .await
     }
 
     /// The redundant-send guard is the mirrored capability's `current`, not a
@@ -677,6 +761,10 @@ fn fresh_text_run() -> (String, i64) {
 impl Provider for AcpProvider {
     fn get_name(&self) -> &str {
         &self.name
+    }
+
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
     }
 
     fn provider_session_id(&self) -> Option<String> {
@@ -1123,7 +1211,7 @@ struct AcpClientLoop {
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     context_size: Arc<AtomicU64>,
-    effort: AcpEffortState,
+    config_state: AcpConfigState,
 }
 
 impl AcpClientLoop {
@@ -1132,7 +1220,7 @@ impl AcpClientLoop {
         goose_mode: Arc<Mutex<GooseMode>>,
         pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
         context_size: Arc<AtomicU64>,
-        effort: AcpEffortState,
+        config_state: AcpConfigState,
     ) -> Self {
         Self {
             config,
@@ -1140,7 +1228,7 @@ impl AcpClientLoop {
             prompt_response_tx: Arc::new(Mutex::new(None)),
             pending_tool_updates,
             context_size,
-            effort,
+            config_state,
         }
     }
 
@@ -1195,11 +1283,11 @@ impl AcpClientLoop {
             prompt_response_tx,
             pending_tool_updates,
             context_size,
-            effort,
+            config_state,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
-        let session_state = AcpSessionState::new(effort);
+        let session_state = AcpSessionState::new(config_state);
 
         Client
             .builder()
@@ -1237,7 +1325,7 @@ impl AcpClientLoop {
                                 }
                             }
                             SessionUpdate::ConfigOptionUpdate(update) => {
-                                publish_effort_state(&session_state.effort, &update.config_options);
+                                publish_config_state(&session_state.config, &update.config_options);
                                 for opt in &update.config_options {
                                     if opt.category == Some(SessionConfigOptionCategory::Mode) {
                                         if let SessionConfigKind::Select(sel) = &opt.kind {
@@ -1575,13 +1663,13 @@ async fn handle_requests(
                         *session_state.active_id.lock().unwrap() = Some(session.session_id.clone());
                         session_ids.push(session.session_id.clone());
                         if let Some(config_options) = session.config_options.as_deref() {
-                            publish_effort_state(&session_state.effort, config_options);
+                            publish_config_state(&session_state.config, config_options);
                         }
                         apply_session_config_options(
                             &config,
                             &cx,
                             session.session_id.clone(),
-                            &session_state.effort,
+                            &session_state.config,
                         )
                         .await?;
                         apply_session_mode(&config, &goose_mode, &cx, session).await
@@ -1599,7 +1687,7 @@ async fn handle_requests(
                     .lock()
                     .unwrap()
                     .replace(session_id.clone());
-                let previous_effort_state = replace_effort_state(&session_state.effort, None);
+                let previous_config_state = take_config_state(&session_state.config);
                 let result = if supports_load {
                     let mcp_servers =
                         filter_supported_servers(&config.mcp_servers, &mcp_capabilities);
@@ -1623,20 +1711,20 @@ async fn handle_requests(
                     Ok(session) => {
                         session_ids.push(session.session_id.clone());
                         if let Some(config_options) = session.config_options.as_deref() {
-                            publish_effort_state(&session_state.effort, config_options);
+                            publish_config_state(&session_state.config, config_options);
                         }
                         apply_session_config_options(
                             &config,
                             &cx,
                             session.session_id.clone(),
-                            &session_state.effort,
+                            &session_state.config,
                         )
                         .await?;
                         apply_session_mode(&config, &goose_mode, &cx, session).await
                     }
                     Err(error) => {
                         *session_state.active_id.lock().unwrap() = previous_session_id;
-                        replace_effort_state(&session_state.effort, previous_effort_state);
+                        restore_config_state(&session_state.config, previous_config_state);
                         Err(error)
                     }
                 };
@@ -1676,8 +1764,7 @@ async fn handle_requests(
                 value,
                 response_tx,
             } => {
-                let value_id = agent_client_protocol::schema::v1::SessionConfigValueId::new(value);
-                let req = SetSessionConfigOptionRequest::new(session_id, config_id, value_id);
+                let req = SetSessionConfigOptionRequest::new(session_id, config_id, value);
                 // The agent rebuilds per-model effort levels in this response,
                 // so it is the freshest source after a goose-initiated switch.
                 let result: Result<()> = cx
@@ -1685,7 +1772,7 @@ async fn handle_requests(
                     .block_task()
                     .await
                     .map(|response| {
-                        publish_effort_state(&session_state.effort, &response.config_options)
+                        publish_config_state(&session_state.config, &response.config_options)
                     })
                     .map_err(anyhow::Error::from);
                 log_undelivered(
@@ -1744,7 +1831,7 @@ async fn apply_session_config_options(
     config: &AcpProviderConfig,
     cx: &ConnectionTo<Agent>,
     session_id: SessionId,
-    effort: &AcpEffortState,
+    config_state: &AcpConfigState,
 ) -> Result<()> {
     for (config_id, value) in &config.session_config_options {
         let value_id = agent_client_protocol::schema::v1::SessionConfigValueId::new(value.clone());
@@ -1765,7 +1852,7 @@ async fn apply_session_config_options(
             })?;
         // Pinning the model here makes the agent rebuild its per-model effort
         // levels, so this response supersedes the session/new snapshot.
-        publish_effort_state(effort, &response.config_options);
+        publish_config_state(config_state, &response.config_options);
     }
     Ok(())
 }
@@ -2242,6 +2329,57 @@ fn publish_effort_state(effort: &AcpEffortState, config_options: &[SessionConfig
     replace_effort_state(effort, capability);
 }
 
+/// Every config-options payload the agent sends is authoritative: it replaces
+/// the stored passthrough set and the derived effort capability together.
+fn publish_config_state(state: &AcpConfigState, config_options: &[SessionConfigOption]) {
+    if let Ok(mut latest) = state.options.lock() {
+        *latest = Some(config_options.to_vec());
+    }
+    publish_effort_state(&state.effort, config_options);
+}
+
+fn take_config_state(state: &AcpConfigState) -> AcpConfigSnapshot {
+    let options = state.options.lock().ok().and_then(|mut latest| latest.take());
+    let capability = replace_effort_state(&state.effort, None);
+    (options, capability)
+}
+
+fn restore_config_state(state: &AcpConfigState, snapshot: AcpConfigSnapshot) {
+    let (options, capability) = snapshot;
+    if let Ok(mut latest) = state.options.lock() {
+        *latest = options;
+    }
+    replace_effort_state(&state.effort, capability);
+}
+
+/// Align the wire shape of a forwarded config value with the option kind the
+/// agent advertised: clients may send `on`/`off` value ids for an option the
+/// agent models as a boolean toggle, or a boolean for an on/off select.
+/// Anything else passes through untouched so the agent's own validation
+/// applies.
+fn align_config_value_with_option_kind(
+    options: &[SessionConfigOption],
+    config_id: &str,
+    value: SessionConfigOptionValue,
+) -> SessionConfigOptionValue {
+    let Some(option) = options.iter().find(|option| option.id.0.as_ref() == config_id) else {
+        return value;
+    };
+    match (&option.kind, &value) {
+        (SessionConfigKind::Boolean(_), SessionConfigOptionValue::ValueId { value: id }) => {
+            match id.0.as_ref() {
+                "on" | "true" => SessionConfigOptionValue::boolean(true),
+                "off" | "false" => SessionConfigOptionValue::boolean(false),
+                _ => value,
+            }
+        }
+        (SessionConfigKind::Select(_), SessionConfigOptionValue::Boolean { value: enabled }) => {
+            SessionConfigOptionValue::value_id(if *enabled { "on" } else { "off" })
+        }
+        _ => value,
+    }
+}
+
 fn replace_effort_state(
     effort: &AcpEffortState,
     capability: Option<ThinkingEffortCapability>,
@@ -2520,6 +2658,7 @@ mod tests {
                 model_config_option_id: None,
                 applied_model: Arc::new(Mutex::new(None)),
                 effort: AcpEffortState::new(),
+                child_config_options: Arc::new(Mutex::new(None)),
                 tx,
                 cancel_tx: None,
                 loop_thread: None,
@@ -3329,7 +3468,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(config_id, "model");
-                assert_eq!(value, "new-model");
+                assert_eq!(
+                    value.as_value_id().map(|id| id.0.as_ref()),
+                    Some("new-model")
+                );
                 let _ = response_tx.send(Ok(()));
             }
             _ => panic!("unexpected request kind"),
@@ -3409,6 +3551,18 @@ mod tests {
     }
 
     async fn expect_set_config_option(rx: &mut mpsc::Receiver<ClientRequest>) -> (String, String) {
+        let (config_id, value) = expect_set_config_option_value(rx).await;
+        let value_id = value
+            .as_value_id()
+            .expect("expected a value-id config value")
+            .0
+            .to_string();
+        (config_id, value_id)
+    }
+
+    async fn expect_set_config_option_value(
+        rx: &mut mpsc::Receiver<ClientRequest>,
+    ) -> (String, SessionConfigOptionValue) {
         match rx.recv().await.expect("expected a SetConfigOption request") {
             ClientRequest::SetConfigOption {
                 config_id,
