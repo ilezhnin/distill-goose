@@ -1,16 +1,16 @@
 use agent_client_protocol::schema::v1::{
     Annotations as AcpAnnotations, ClientCapabilities, CloseSessionRequest, ContentBlock,
     ContentChunk, EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, Role as AcpRole,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
     SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, TextContent, ToolCallContent, ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, Client, ConnectionTo};
+use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcMessage, UntypedMessage};
 use agent_client_protocol_schema::v1::Usage as AcpUsage;
 use agent_client_protocol_schema::v1::AGENT_METHOD_NAMES;
 use anyhow::{Context, Result};
@@ -75,13 +75,23 @@ pub struct AcpProviderConfig {
     pub notification_callback: Option<Arc<dyn Fn(SessionNotification) + Send + Sync>>,
 }
 
+/// The single ACP session backing this provider instance.
+#[derive(Clone, Debug)]
+struct AcpSession {
+    id: SessionId,
+    response: NewSessionResponse,
+    /// Models advertised on `session/new` / `session/load` via the ACP `models`
+    /// field. Agents that expose this use `session/set_model` to switch.
+    advertised_models: Option<(String, Vec<String>)>,
+}
+
 enum ClientRequest {
     NewSession {
-        response_tx: oneshot::Sender<Result<NewSessionResponse>>,
+        response_tx: oneshot::Sender<Result<AcpSession>>,
     },
     LoadSession {
         session_id: SessionId,
-        response_tx: oneshot::Sender<Result<NewSessionResponse>>,
+        response_tx: oneshot::Sender<Result<AcpSession>>,
     },
     CloseSession {
         session_id: SessionId,
@@ -95,6 +105,11 @@ enum ClientRequest {
         session_id: SessionId,
         config_id: String,
         value: SessionConfigOptionValue,
+        response_tx: oneshot::Sender<Result<()>>,
+    },
+    SetModel {
+        session_id: SessionId,
+        model_id: String,
         response_tx: oneshot::Sender<Result<()>>,
     },
     Prompt {
@@ -193,13 +208,6 @@ fn provider_error_from_acp(error: agent_client_protocol::Error) -> ProviderError
 struct AccumulatedToolCall {
     raw_output: Option<serde_json::Value>,
     content: Vec<ToolCallContent>,
-}
-
-/// The single ACP session backing this provider instance.
-#[derive(Clone)]
-struct AcpSession {
-    id: SessionId,
-    response: NewSessionResponse,
 }
 
 struct HandoffContextClaim {
@@ -307,8 +315,7 @@ pub struct AcpProvider {
 
     /// Config option id used to select the model, if this agent supports it.
     model_config_option_id: Option<String>,
-    /// Model currently applied via `model_config_option_id`, used to avoid
-    /// redundant `SetConfigOption` calls.
+    /// Model currently applied via config option or `session/set_model`.
     applied_model: Arc<Mutex<Option<String>>>,
 
     /// The agent's thinking-effort config option, mirrored from every
@@ -453,14 +460,9 @@ impl AcpProvider {
             })
             .await
             .context("ACP client is unavailable")?;
-        let response = session_rx
+        let session = session_rx
             .await
             .context("ACP session creation cancelled")??;
-
-        let session = AcpSession {
-            id: response.session_id.clone(),
-            response,
-        };
 
         Ok(Self {
             name,
@@ -496,11 +498,7 @@ impl AcpProvider {
             })
             .await
             .context("ACP client is unavailable")?;
-        let response = response_rx.await.context("ACP session load cancelled")??;
-        Ok(AcpSession {
-            id: response.session_id.clone(),
-            response,
-        })
+        response_rx.await.context("ACP session load cancelled")?
     }
 
     pub(crate) async fn send_set_mode(&self, _goose_id: &str, mode_id: String) -> Result<()> {
@@ -551,15 +549,21 @@ impl AcpProvider {
         response_rx.await.context("ACP request cancelled")?
     }
 
-    /// Re-apply the model selection config option when the active session model
-    /// differs from what was last applied. ACP agents that select their model
-    /// via a config option (e.g. Copilot) need this so resumed or switched
-    /// sessions actually use the requested model instead of the agent default.
+    /// Re-apply the model selection when the active session model differs from
+    /// what was last applied. Agents that advertise a model config option get
+    /// `session/set_config_option`; agents that advertise ACP `models` get
+    /// `session/set_model`.
     async fn apply_model_if_changed(&self, model_name: &str) -> Result<()> {
-        let Some(config_id) = self.model_config_option_id.clone() else {
-            return Ok(());
-        };
         if model_name == ACP_CURRENT_MODEL {
+            return Ok(());
+        }
+        let uses_session_set_model = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session lock poisoned"))?
+            .advertised_models
+            .is_some();
+        if self.model_config_option_id.is_none() && !uses_session_set_model {
             return Ok(());
         }
 
@@ -573,8 +577,12 @@ impl AcpProvider {
             }
         }
 
-        self.send_set_config_option("", config_id, model_name.to_string())
-            .await?;
+        if let Some(config_id) = self.model_config_option_id.clone() {
+            self.send_set_config_option("", config_id, model_name.to_string())
+                .await?;
+        } else {
+            self.send_set_model(model_name.to_string()).await?;
+        }
 
         let mut applied = self
             .applied_model
@@ -685,6 +693,22 @@ impl AcpProvider {
 
         self.set_effort_option("", &capability.option_id, mapped)
             .await
+    }
+
+    pub(crate) async fn send_set_model(&self, model_id: String) -> Result<()> {
+        let session_id = self.acp_session_id();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .as_ref()
+            .unwrap()
+            .send(ClientRequest::SetModel {
+                session_id,
+                model_id,
+                response_tx,
+            })
+            .await
+            .context("ACP client is unavailable")?;
+        response_rx.await.context("ACP request cancelled")?
     }
 
     async fn prompt(
@@ -1189,6 +1213,12 @@ impl Provider for AcpProvider {
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
         let session = self.session.lock().unwrap().clone();
+        if let Some((_, available)) = session
+            .advertised_models
+            .filter(|(_, models)| !models.is_empty())
+        {
+            return Ok(available);
+        }
         let (_, available) = resolve_model_info(&self.name, &session.response)?;
         Ok(available)
     }
@@ -1653,28 +1683,32 @@ async fn handle_requests(
         match request {
             ClientRequest::NewSession { response_tx } => {
                 let mcp_servers = filter_supported_servers(&config.mcp_servers, &mcp_capabilities);
-                let session = cx
-                    .send_request(
-                        NewSessionRequest::new(config.work_dir.clone()).mcp_servers(mcp_servers),
-                    )
-                    .block_task()
-                    .await;
-                let result = match session {
-                    Ok(session) => {
-                        *session_state.active_id.lock().unwrap() = Some(session.session_id.clone());
-                        session_ids.push(session.session_id.clone());
-                        if let Some(config_options) = session.config_options.as_deref() {
-                            publish_config_state(&session_state.config, config_options);
+                let request =
+                    NewSessionRequest::new(config.work_dir.clone()).mcp_servers(mcp_servers);
+                let result = match send_typed_request_as_json(&cx, &request).await {
+                    Ok(raw) => match acp_session_from_new_response(raw) {
+                        Ok(mut session) => {
+                            *session_state.active_id.lock().unwrap() = Some(session.id.clone());
+                            session_ids.push(session.id.clone());
+                            if let Some(config_options) =
+                                session.response.config_options.as_deref()
+                            {
+                                publish_config_state(&session_state.config, config_options);
+                            }
+                            apply_session_config_options(
+                                &config,
+                                &cx,
+                                session.id.clone(),
+                                &session_state.config,
+                            )
+                            .await?;
+                            session.response =
+                                apply_session_mode(&config, &goose_mode, &cx, session.response)
+                                    .await?;
+                            Ok(session)
                         }
-                        apply_session_config_options(
-                            &config,
-                            &cx,
-                            session.session_id.clone(),
-                            &session_state.config,
-                        )
-                        .await?;
-                        apply_session_mode(&config, &goose_mode, &cx, session).await
-                    }
+                        Err(error) => Err(error),
+                    },
                     Err(error) => Err(acp_method_error(AGENT_METHOD_NAMES.session_new, error)),
                 };
                 log_undelivered(response_tx.send(result), AGENT_METHOD_NAMES.session_new);
@@ -1692,36 +1726,32 @@ async fn handle_requests(
                 let result = if supports_load {
                     let mcp_servers =
                         filter_supported_servers(&config.mcp_servers, &mcp_capabilities);
-                    cx.send_request(
+                    let request =
                         LoadSessionRequest::new(session_id.clone(), config.work_dir.clone())
-                            .mcp_servers(mcp_servers),
-                    )
-                    .block_task()
-                    .await
-                    .map(|response| {
-                        NewSessionResponse::new(session_id.clone())
-                            .modes(response.modes)
-                            .config_options(response.config_options)
-                            .meta(response.meta)
-                    })
-                    .map_err(anyhow::Error::from)
+                            .mcp_servers(mcp_servers);
+                    match send_typed_request_as_json(&cx, &request).await {
+                        Ok(raw) => acp_session_from_load_response(session_id.clone(), raw),
+                        Err(error) => Err(anyhow::Error::from(error)),
+                    }
                 } else {
                     Err(anyhow::anyhow!("ACP agent does not support session/load"))
                 };
                 let result = match result {
-                    Ok(session) => {
-                        session_ids.push(session.session_id.clone());
-                        if let Some(config_options) = session.config_options.as_deref() {
+                    Ok(mut session) => {
+                        session_ids.push(session.id.clone());
+                        if let Some(config_options) = session.response.config_options.as_deref() {
                             publish_config_state(&session_state.config, config_options);
                         }
                         apply_session_config_options(
                             &config,
                             &cx,
-                            session.session_id.clone(),
+                            session.id.clone(),
                             &session_state.config,
                         )
                         .await?;
-                        apply_session_mode(&config, &goose_mode, &cx, session).await
+                        session.response =
+                            apply_session_mode(&config, &goose_mode, &cx, session.response).await?;
+                        Ok(session)
                     }
                     Err(error) => {
                         *session_state.active_id.lock().unwrap() = previous_session_id;
@@ -1780,6 +1810,29 @@ async fn handle_requests(
                     response_tx.send(result),
                     AGENT_METHOD_NAMES.session_set_config_option,
                 );
+            }
+            ClientRequest::SetModel {
+                session_id,
+                model_id,
+                response_tx,
+            } => {
+                let request = UntypedMessage::new(
+                    "session/set_model",
+                    serde_json::json!({
+                        "sessionId": session_id.0.to_string(),
+                        "modelId": model_id,
+                    }),
+                );
+                let result: Result<()> = match request {
+                    Ok(request) => cx
+                        .send_request(request)
+                        .block_task()
+                        .await
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from),
+                    Err(error) => Err(anyhow::Error::from(error)),
+                };
+                log_undelivered(response_tx.send(result), "session/set_model");
             }
             ClientRequest::Prompt {
                 session_id,
@@ -2234,6 +2287,64 @@ fn extract_model_info_from_config_options(
     Some((current, available))
 }
 
+fn extract_model_info_from_session_models(
+    raw: &serde_json::Value,
+) -> Option<(String, Vec<String>)> {
+    let models = raw.get("models")?;
+    let available: Vec<String> = models
+        .get("availableModels")?
+        .as_array()?
+        .iter()
+        .filter_map(|model| model.get("modelId")?.as_str().map(str::to_string))
+        .collect();
+    if available.is_empty() {
+        return None;
+    }
+    let current = models
+        .get("currentModelId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| available.first().cloned())?;
+    Some((current, available))
+}
+
+fn acp_session_from_new_response(raw: serde_json::Value) -> Result<AcpSession> {
+    let advertised_models = extract_model_info_from_session_models(&raw);
+    let response: NewSessionResponse =
+        serde_json::from_value(raw).context("invalid session/new response")?;
+    Ok(AcpSession {
+        id: response.session_id.clone(),
+        response,
+        advertised_models,
+    })
+}
+
+fn acp_session_from_load_response(
+    session_id: SessionId,
+    raw: serde_json::Value,
+) -> Result<AcpSession> {
+    let advertised_models = extract_model_info_from_session_models(&raw);
+    let response: LoadSessionResponse =
+        serde_json::from_value(raw).context("invalid session/load response")?;
+    Ok(AcpSession {
+        id: session_id.clone(),
+        response: NewSessionResponse::new(session_id)
+            .modes(response.modes)
+            .config_options(response.config_options)
+            .meta(response.meta),
+        advertised_models,
+    })
+}
+
+async fn send_typed_request_as_json<Req: JsonRpcMessage>(
+    cx: &ConnectionTo<Agent>,
+    request: &Req,
+) -> Result<serde_json::Value, agent_client_protocol::Error> {
+    cx.send_request(request.to_untyped_message()?)
+        .block_task()
+        .await
+}
+
 fn resolve_model_info(
     provider_name: &str,
     response: &NewSessionResponse,
@@ -2648,6 +2759,7 @@ mod tests {
                 session: Mutex::new(AcpSession {
                     id: SessionId::new("test-session"),
                     response: NewSessionResponse::new("test-session"),
+                    advertised_models: None,
                 }),
                 pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
@@ -2996,7 +3108,11 @@ mod tests {
         };
         assert_eq!(session_id.to_string(), "saved-session");
         response_tx
-            .send(Ok(NewSessionResponse::new("saved-session")))
+            .send(Ok(AcpSession {
+                id: SessionId::new("saved-session"),
+                response: NewSessionResponse::new("saved-session"),
+                advertised_models: None,
+            }))
             .unwrap();
 
         let ClientRequest::CloseSession { session_id } =
@@ -3520,6 +3636,32 @@ mod tests {
         provider.apply_model_if_changed("any-model").await.unwrap();
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_model_if_changed_sends_set_model_when_configured() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (provider, _) = test_provider_with_tx(Some(tx));
+        provider.session.lock().unwrap().advertised_models = Some((
+            "grok-4.6".to_string(),
+            vec!["grok-4.6".to_string(), "grok-4.5".to_string()],
+        ));
+
+        let handle = tokio::spawn(async move { provider.apply_model_if_changed("grok-4.5").await });
+
+        match rx.recv().await.expect("expected a SetModel request") {
+            ClientRequest::SetModel {
+                model_id,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(model_id, "grok-4.5");
+                let _ = response_tx.send(Ok(()));
+            }
+            _ => panic!("unexpected request kind"),
+        }
+
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -4560,6 +4702,27 @@ mod tests {
         response: NewSessionResponse,
     ) -> Result<(String, Vec<String>), ProviderError> {
         resolve_model_info("test", &response)
+    }
+
+    #[test]
+    fn extract_model_info_from_session_models_reads_acp_models_field() {
+        let raw = serde_json::json!({
+            "sessionId": "s1",
+            "models": {
+                "currentModelId": "grok-4.6",
+                "availableModels": [
+                    { "modelId": "grok-4.6", "name": "Grok 4.6" },
+                    { "modelId": "grok-4.5", "name": "Grok 4.5" }
+                ]
+            }
+        });
+
+        let (current, available) = extract_model_info_from_session_models(&raw).unwrap();
+        assert_eq!(current, "grok-4.6");
+        assert_eq!(
+            available,
+            vec!["grok-4.6".to_string(), "grok-4.5".to_string()]
+        );
     }
 
     fn duplicate_read_only_reverse_modes() -> HashMap<String, Vec<GooseMode>> {

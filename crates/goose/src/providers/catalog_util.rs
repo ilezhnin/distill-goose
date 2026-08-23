@@ -113,6 +113,13 @@ mod tests {
         assert_eq!(claude.category, ProviderSetupCategory::Agent);
         assert!(claude.acp);
 
+        let grok = entries
+            .iter()
+            .find(|entry| entry.provider_id == "grok-acp")
+            .expect("setup catalog should include grok-acp");
+        assert_eq!(grok.category, ProviderSetupCategory::Agent);
+        assert!(grok.acp);
+
         let ollama = entries
             .iter()
             .find(|entry| entry.provider_id == "ollama")

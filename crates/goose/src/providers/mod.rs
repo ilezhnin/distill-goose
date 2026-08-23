@@ -44,6 +44,7 @@ pub mod google {
 }
 pub mod gondola;
 pub mod google_def;
+pub mod grok_acp;
 pub mod http_status {
     pub use goose_providers::http_status::*;
 }

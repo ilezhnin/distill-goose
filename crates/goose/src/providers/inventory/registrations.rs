@@ -13,6 +13,7 @@ use crate::providers::copilot_acp::{COPILOT_ACP_BINARY, COPILOT_ACP_PROVIDER_NAM
 use crate::providers::formats::anthropic::ANTHROPIC_PROVIDER_NAME;
 use crate::providers::gemini_oauth::TokenCache as GeminiOAuthTokenCache;
 use crate::providers::google::{GOOGLE_API_HOST, GOOGLE_PROVIDER_NAME};
+use crate::providers::grok_acp::{GROK_ACP_BINARY, GROK_ACP_PROVIDER_NAME};
 use crate::providers::huggingface::HuggingFaceProvider;
 use crate::providers::huggingface_auth;
 use crate::providers::kimicode;
@@ -249,6 +250,10 @@ pub fn claude_acp_inventory() -> InventoryRegistration {
 
 pub fn codex_acp_inventory() -> InventoryRegistration {
     acp_inventory(CODEX_ACP_PROVIDER_NAME, CODEX_ACP_PROVIDER_NAME, true)
+}
+
+pub fn grok_acp_inventory() -> InventoryRegistration {
+    acp_inventory(GROK_ACP_PROVIDER_NAME, GROK_ACP_BINARY, true)
 }
 
 pub fn copilot_acp_inventory() -> InventoryRegistration {
