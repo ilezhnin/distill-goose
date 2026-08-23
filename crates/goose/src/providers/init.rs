@@ -24,6 +24,7 @@ use super::{
     gemini_oauth::GeminiOAuthProvider,
     githubcopilot::GithubCopilotProvider,
     gondola::GondolaProvider,
+    grok_acp::GrokAcpProvider,
     huggingface::HuggingFaceProvider,
     kimicode::KimiCodeProvider,
     litellm::LiteLLMProvider,
@@ -117,6 +118,10 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
         registry.register_with_inventory::<GeminiOAuthProvider>(
             false,
             Some(registrations::gemini_oauth_inventory()),
+        );
+        registry.register_with_inventory::<GrokAcpProvider>(
+            false,
+            Some(registrations::grok_acp_inventory()),
         );
         registry.register_with_inventory::<GithubCopilotProvider>(
             false,
