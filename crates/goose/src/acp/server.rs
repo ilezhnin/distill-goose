@@ -701,9 +701,17 @@ pub(super) struct UsageUpdates {
 pub(super) fn build_usage_updates(
     session: &Session,
     totals: &SessionUsageTotals,
+    provider_context_limit: Option<usize>,
 ) -> Option<UsageUpdates> {
     let used = session.usage.total_tokens.unwrap_or(0).max(0) as u64;
-    let ctx_limit = session.model_config.as_ref()?.context_limit() as u64;
+    // Prefer the provider-resolved limit: for ACP-wrapped agents (Claude Code
+    // etc.) it carries the context size the agent itself reported, while the
+    // raw model config falls back to the 128k catalog default for model names
+    // the catalog cannot resolve (e.g. "[1m]" variants).
+    let ctx_limit = match provider_context_limit {
+        Some(limit) => limit as u64,
+        None => session.model_config.as_ref()?.context_limit() as u64,
+    };
     let accumulated_input_tokens =
         to_nonnegative_u64(totals.accumulated_usage.input_tokens).unwrap_or(0);
     let accumulated_output_tokens =
@@ -2130,7 +2138,17 @@ impl GooseAcpAgent {
             .get_session_usage_totals(&session_id)
             .await
             .unwrap_or_default();
-        if let Some(updates) = build_usage_updates(&session, &totals) {
+        // The provider knows the real context window better than the raw model
+        // config does — an ACP-wrapped agent reports its own size (1M-context
+        // variants included), which `get_context_limit` surfaces.
+        let provider_context_limit = match session.model_config.as_ref() {
+            Some(model_config) => match agent.provider().await {
+                Ok(provider) => provider.get_context_limit(model_config).await.ok(),
+                Err(_) => None,
+            },
+            None => None,
+        };
+        if let Some(updates) = build_usage_updates(&session, &totals, provider_context_limit) {
             if self.supports_goose_custom_notifications() {
                 cx.send_notification(updates.custom)?;
             }
@@ -3272,8 +3290,8 @@ print(\"hello, world\")
             accumulated_usage: session.accumulated_usage,
             accumulated_cost: session.accumulated_cost,
         };
-        let updates =
-            build_usage_updates(&session, &totals).expect("usage updates should be present");
+        let updates = build_usage_updates(&session, &totals, None)
+            .expect("usage updates should be present");
         assert_eq!(updates.custom.session_id, "session-1");
         let usage = match updates.custom.update {
             GooseSessionUpdate::UsageUpdate(usage) => usage,
@@ -3291,7 +3309,33 @@ print(\"hello, world\")
             TokenUsage::new(Some(80), Some(40), Some(120)),
             TokenUsage::default(),
         );
-        assert!(build_usage_updates(&session, &SessionUsageTotals::default()).is_none());
+        assert!(build_usage_updates(&session, &SessionUsageTotals::default(), None).is_none());
+    }
+
+    #[test]
+    fn test_build_usage_update_prefers_provider_context_limit() {
+        // An ACP-wrapped agent (e.g. Claude Code on a 1M-context model) reports
+        // its real window; the raw model config would fall back to the 128k
+        // catalog default for a model name the catalog cannot resolve.
+        let mut session = make_session_with_usage(
+            TokenUsage::new(Some(0), Some(0), Some(94_913)),
+            TokenUsage::default(),
+        );
+        session.model_config = Some(goose_providers::model::ModelConfig::new(
+            "claude-opus-unresolved[1m]",
+        ));
+        let totals = SessionUsageTotals {
+            accumulated_usage: session.accumulated_usage,
+            accumulated_cost: session.accumulated_cost,
+        };
+        let updates = build_usage_updates(&session, &totals, Some(1_000_000))
+            .expect("usage updates should be present");
+        let usage = match updates.custom.update {
+            GooseSessionUpdate::UsageUpdate(usage) => usage,
+            other => panic!("expected usage update, got {other:?}"),
+        };
+        assert_eq!(usage.context_limit, 1_000_000);
+        assert_eq!(updates.standard.size, 1_000_000);
     }
 
     #[test]

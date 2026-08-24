@@ -564,7 +564,10 @@ pub(super) fn send_session_setup_notifications(
     supports_goose_custom_notifications: bool,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = SessionId::new(session.id.clone());
-    if let Some(updates) = build_usage_updates(session, totals) {
+    // Setup/replay runs before the session's provider has reported anything,
+    // so there is no provider-resolved limit yet; the model-config value is
+    // the best available and the first prompt's usage update corrects it.
+    if let Some(updates) = build_usage_updates(session, totals, None) {
         if supports_goose_custom_notifications {
             cx.send_notification(updates.custom)?;
         }
