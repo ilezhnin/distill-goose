@@ -553,17 +553,33 @@ impl AcpProvider {
     /// what was last applied. Agents that advertise a model config option get
     /// `session/set_config_option`; agents that advertise ACP `models` get
     /// `session/set_model`.
+    ///
+    /// An agent can advertise both, in two id spaces that do not overlap.
+    /// codex-acp lists one ACP `models.availableModels` entry per (model,
+    /// effort) pair — `gpt-5.6-sol[xhigh]` — while its `model` config option is
+    /// a select over bare model ids with the effort split off into
+    /// `reasoning_effort`, and it answers `Invalid params` to anything outside
+    /// that bare list. `fetch_supported_models` reads the ACP `models` block,
+    /// so that is the id space every model goose can be pinned to comes from:
+    /// sending one of those ids to the config option failed on EVERY send, this
+    /// being called from `stream()`, and a session pinned to a codex model
+    /// could not run at all.
+    ///
+    /// So the channel follows the id rather than the agent: the config option
+    /// keeps its priority whenever it offers this id — or does not say what it
+    /// offers — and `session/set_model` takes the ids only the `models` block
+    /// lists.
     async fn apply_model_if_changed(&self, model_name: &str) -> Result<()> {
         if model_name == ACP_CURRENT_MODEL {
             return Ok(());
         }
-        let uses_session_set_model = self
+        let advertised_models = self
             .session
             .lock()
             .map_err(|_| anyhow::anyhow!("session lock poisoned"))?
             .advertised_models
-            .is_some();
-        if self.model_config_option_id.is_none() && !uses_session_set_model {
+            .clone();
+        if self.model_config_option_id.is_none() && advertised_models.is_none() {
             return Ok(());
         }
 
@@ -577,11 +593,25 @@ impl AcpProvider {
             }
         }
 
-        if let Some(config_id) = self.model_config_option_id.clone() {
-            self.send_set_config_option("", config_id, model_name.to_string())
-                .await?;
-        } else {
-            self.send_set_model(model_name.to_string()).await?;
+        let served_by_set_model = advertised_models
+            .as_ref()
+            .is_some_and(|(_, models)| models.iter().any(|model| model == model_name));
+
+        match self.model_config_option_id.as_deref() {
+            Some(config_id)
+                if !served_by_set_model
+                    || config_option_serves_model(
+                        &self.child_session_config_options(),
+                        config_id,
+                        model_name,
+                    ) =>
+            {
+                self.send_set_config_option("", config_id.to_string(), model_name.to_string())
+                    .await?;
+            }
+            _ => {
+                self.send_set_model(model_name.to_string()).await?;
+            }
         }
 
         let mut applied = self
@@ -2266,6 +2296,32 @@ fn build_action_required_message(request: &RequestPermissionRequest) -> Option<M
     )
 }
 
+/// True when the agent's model config option is one this id can be sent to.
+///
+/// An agent that has not sent its config options yet, that offers no option
+/// under this id, or whose model option is not a select answers `true`: the
+/// option is then all goose knows about, so the long-standing behaviour —
+/// send the id there — stays the best guess available. Only an option that
+/// does list its values, and does not list this one, sends the caller looking
+/// for the other channel.
+fn config_option_serves_model(
+    options: &[SessionConfigOption],
+    config_id: &str,
+    model_name: &str,
+) -> bool {
+    let Some(option) = options
+        .iter()
+        .find(|option| option.id.0.as_ref() == config_id)
+    else {
+        return true;
+    };
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return true;
+    };
+    let values = select_option_values(&select.options);
+    values.is_empty() || values.iter().any(|value| value.value == model_name)
+}
+
 fn extract_model_info_from_config_options(
     config_options: &[SessionConfigOption],
 ) -> Option<(String, Vec<String>)> {
@@ -3656,6 +3712,113 @@ mod tests {
                 ..
             } => {
                 assert_eq!(model_id, "grok-4.5");
+                let _ = response_tx.send(Ok(()));
+            }
+            _ => panic!("unexpected request kind"),
+        }
+
+        handle.await.unwrap().unwrap();
+    }
+
+    /// The codex-acp shape: the same session advertises `models` entries that
+    /// carry the reasoning effort in the id, and a `model` config option that
+    /// only takes the bare ids. Goose pins models from the first list, so the
+    /// id has to travel over `session/set_model` — the config option rejects it
+    /// with `Invalid params`, and it does so from `stream()`, once per send.
+    #[tokio::test]
+    async fn apply_model_if_changed_uses_set_model_for_ids_the_config_option_lacks() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let provider = test_provider_with_model_option(tx, None);
+        provider.session.lock().unwrap().advertised_models = Some((
+            "gpt-5.6-sol[medium]".to_string(),
+            vec![
+                "gpt-5.6-sol[medium]".to_string(),
+                "gpt-5.6-sol[xhigh]".to_string(),
+            ],
+        ));
+        *provider.child_config_options.lock().unwrap() = Some(vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.6-sol",
+            effort_select_options(&["gpt-5.6-sol", "gpt-5.6-codex"]),
+        )]);
+
+        let pinned = "gpt-5.6-sol[xhigh]";
+        let handle = tokio::spawn(async move { provider.apply_model_if_changed(pinned).await });
+
+        match rx.recv().await.expect("expected a SetModel request") {
+            ClientRequest::SetModel {
+                model_id,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(model_id, "gpt-5.6-sol[xhigh]");
+                let _ = response_tx.send(Ok(()));
+            }
+            _ => panic!("unexpected request kind"),
+        }
+
+        handle.await.unwrap().unwrap();
+    }
+
+    /// An agent whose two channels agree on the id keeps using the config
+    /// option: it is the one that reports back the agent's rebuilt options.
+    #[tokio::test]
+    async fn apply_model_if_changed_keeps_config_option_when_it_offers_the_id() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let provider = test_provider_with_model_option(tx, None);
+        provider.session.lock().unwrap().advertised_models = Some((
+            "opus-5".to_string(),
+            vec!["opus-5".to_string(), "sonnet-5".to_string()],
+        ));
+        *provider.child_config_options.lock().unwrap() = Some(vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "opus-5",
+            effort_select_options(&["opus-5", "sonnet-5"]),
+        )]);
+
+        let handle = tokio::spawn(async move { provider.apply_model_if_changed("sonnet-5").await });
+
+        match rx.recv().await.expect("expected a SetConfigOption request") {
+            ClientRequest::SetConfigOption {
+                config_id,
+                value,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(config_id, "model");
+                assert_eq!(
+                    value.as_value_id().map(|id| id.0.as_ref()),
+                    Some("sonnet-5")
+                );
+                let _ = response_tx.send(Ok(()));
+            }
+            _ => panic!("unexpected request kind"),
+        }
+
+        handle.await.unwrap().unwrap();
+    }
+
+    /// An agent that has not said what its model option offers keeps the
+    /// long-standing route. Guessing the other channel off a silence would
+    /// change behaviour for every agent that never mirrors its options.
+    #[tokio::test]
+    async fn apply_model_if_changed_keeps_config_option_when_options_are_unknown() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let provider = test_provider_with_model_option(tx, None);
+        provider.session.lock().unwrap().advertised_models =
+            Some(("model-a".to_string(), vec!["model-a".to_string()]));
+
+        let handle = tokio::spawn(async move { provider.apply_model_if_changed("model-a").await });
+
+        match rx.recv().await.expect("expected a SetConfigOption request") {
+            ClientRequest::SetConfigOption {
+                config_id,
+                response_tx,
+                ..
+            } => {
+                assert_eq!(config_id, "model");
                 let _ = response_tx.send(Ok(()));
             }
             _ => panic!("unexpected request kind"),
